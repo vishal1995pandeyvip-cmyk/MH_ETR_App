@@ -1,0 +1,19 @@
+confidential/
+*.xls
+*.xlsx
+__pycache__/
+*.pyc
+
+# Raw source inputs (large; already preprocessed into small files under data/,
+# which IS committed since the app reads from there at runtime)
+temperature/
+Shape_File/
+India_SRTM/
+
+# Local-only version snapshots (each duplicates data/; not needed to run the
+# deployed app - Versions/Version_N/VERSION_INFO.md has the summary if ever needed)
+Versions/
+
+# Runtime/log artifacts
+*.log
+streamlit_log.txt
