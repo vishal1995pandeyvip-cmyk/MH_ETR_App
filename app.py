@@ -21,6 +21,8 @@ from streamlit_folium import st_folium
 import etr_core as core
 import etr_grid as grid
 import etr_historical as hist
+import etr_skymet as skymet
+import etr_skymet_live as skymet_live
 
 st.set_page_config(page_title="Maharashtra ETR (Hargreaves)", layout="wide")
 
@@ -67,6 +69,26 @@ def load_history_availability():
     return hist.load_availability()
 
 
+@st.cache_resource
+def load_skymet_state():
+    return skymet.load_state_history()
+
+
+@st.cache_resource
+def load_skymet_district():
+    return skymet.load_district_history()
+
+
+@st.cache_resource
+def load_skymet_taluka():
+    return skymet.load_taluka_history()
+
+
+@st.cache_resource
+def load_skymet_availability():
+    return skymet.load_availability()
+
+
 @st.cache_data(ttl=3600)
 def fetch_weather(lat, lon, mode, start_date=None, end_date=None, forecast_days=7):
     return core.fetch_weather_uncached(lat, lon, mode, start_date, end_date, forecast_days)
@@ -75,6 +97,36 @@ def fetch_weather(lat, lon, mode, start_date=None, end_date=None, forecast_days=
 @st.cache_data(ttl=3600)
 def reverse_geocode(lat, lon):
     return core.reverse_geocode_uncached(lat, lon)
+
+
+@st.cache_data
+def load_skymet_station_coords():
+    return skymet_live.load_station_coords()
+
+
+@st.cache_data(ttl=1500, show_spinner=False)  # 25 min - the API token itself expires at 30 min
+def login_skymet_live():
+    if "skymet_username" not in st.secrets or "skymet_password" not in st.secrets:
+        raise RuntimeError(
+            "Skymet live credentials aren't configured. Add skymet_username/skymet_password "
+            "to .streamlit/secrets.toml locally, or to the app's Secrets in Streamlit Cloud."
+        )
+    return skymet_live.login(st.secrets["skymet_username"], st.secrets["skymet_password"])
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_skymet_point_series(lat, lon, start_date, end_date):
+    """Returns (station_info_or_None, nearest_info, daily_df). station_info is None
+    if the nearest station is farther than the max radius; nearest_info always has
+    the nearest station's distance, for a helpful message either way."""
+    coords = load_skymet_station_coords()
+    station, nearest_info = skymet_live.nearest_station(lat, lon, coords)
+    if station is None:
+        return None, nearest_info, None
+    token = login_skymet_live()
+    records = skymet_live.fetch_station_range(token, station["stationid"], start_date, end_date)
+    daily = skymet_live.records_to_daily(records)
+    return station, nearest_info, daily
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -155,22 +207,38 @@ with tab_point:
     with col_controls:
         st.subheader("Settings")
         mode_label = st.radio(
-            "Period",
-            ["Upcoming forecast", "Past date range"],
-            help="Forecast uses Open-Meteo's weather forecast; past dates use its historical archive.",
+            "Period / source",
+            ["Upcoming forecast", "Past date range", "Skymet live (nearest station)"],
+            help=(
+                "Forecast/Past date range use Open-Meteo (modeled). Skymet live uses the real "
+                "PoCRA weather station nearest your clicked point - observed readings only, no "
+                "forecast, and only where a station is nearby."
+            ),
         )
 
         if mode_label == "Upcoming forecast":
             mode = "forecast"
             forecast_days = st.slider("Number of days ahead (incl. today)", 1, 16, 7)
             start_date = end_date = None
-        else:
+        elif mode_label == "Past date range":
             mode = "historical"
             default_start = date.today() - timedelta(days=7)
             d_range = st.date_input(
                 "Date range",
                 value=(default_start, date.today() - timedelta(days=1)),
                 max_value=date.today() - timedelta(days=1),
+            )
+            if isinstance(d_range, tuple) and len(d_range) == 2:
+                start_date, end_date = d_range
+            else:
+                start_date = end_date = d_range
+            forecast_days = 7
+        else:
+            mode = "skymet_live"
+            default_start = date.today() - timedelta(days=7)
+            d_range = st.date_input(
+                "Date range", value=(default_start, date.today()),
+                max_value=date.today(), key="skymet_live_range",
             )
             if isinstance(d_range, tuple) and len(d_range) == 2:
                 start_date, end_date = d_range
@@ -314,28 +382,63 @@ with tab_point:
 
     if st.session_state.clicked:
         lat, lon = st.session_state.clicked
-        try:
-            with st.spinner("Fetching weather data..."):
-                weather_df = fetch_weather(
-                    lat, lon, mode,
-                    start_date=start_date, end_date=end_date,
-                    forecast_days=forecast_days,
-                )
-            if weather_df.empty:
-                st.error("No weather data returned for this location/period.")
-            else:
-                etr_df = core.compute_etr_table(weather_df, lat)
-                st.subheader("Results")
-                st.dataframe(etr_df, use_container_width=True, hide_index=True)
-                st.line_chart(etr_df.set_index("Date")["ETR (mm/day)"])
+        if mode == "skymet_live":
+            try:
+                with st.spinner("Finding nearest Skymet station and fetching its data..."):
+                    station, nearest_info, daily_df = fetch_skymet_point_series(
+                        lat, lon, start_date, end_date
+                    )
+                if station is None:
+                    st.warning(
+                        f"No Skymet station within 25 km of this point - nearest one is "
+                        f"**{nearest_info['distance_km']:.1f} km** away. Try clicking closer to "
+                        "a populated agricultural area, or use Open-Meteo instead."
+                    )
+                elif daily_df.empty:
+                    st.error("The nearest station returned no data for this date range.")
+                else:
+                    st.caption(
+                        f"Nearest station: **#{station['stationid']}**, "
+                        f"{station['distance_km']:.1f} km from your clicked point "
+                        f"({station['lat']:.4f}, {station['lon']:.4f})."
+                    )
+                    etr_df = core.compute_etr_table(daily_df, station["lat"])
+                    st.subheader("Results")
+                    st.dataframe(etr_df, use_container_width=True, hide_index=True)
+                    st.line_chart(etr_df.set_index("Date")["ETR (mm/day)"])
 
-                avg_etr = etr_df["ETR (mm/day)"].mean()
-                st.metric("Average ETR over period (mm/day)", f"{avg_etr:.2f}")
+                    avg_etr = etr_df["ETR (mm/day)"].mean()
+                    st.metric("Average ETR over period (mm/day)", f"{avg_etr:.2f}")
 
-                csv = etr_df.to_csv(index=False).encode("utf-8")
-                st.download_button("Download results as CSV", csv, "etr_results.csv", "text/csv")
-        except Exception as e:
-            st.error(f"Could not fetch weather data: {e}")
+                    csv = etr_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "Download results as CSV", csv, "etr_results_skymet_live.csv", "text/csv"
+                    )
+            except Exception as e:
+                st.error(f"Could not fetch Skymet live data: {e}")
+        else:
+            try:
+                with st.spinner("Fetching weather data..."):
+                    weather_df = fetch_weather(
+                        lat, lon, mode,
+                        start_date=start_date, end_date=end_date,
+                        forecast_days=forecast_days,
+                    )
+                if weather_df.empty:
+                    st.error("No weather data returned for this location/period.")
+                else:
+                    etr_df = core.compute_etr_table(weather_df, lat)
+                    st.subheader("Results")
+                    st.dataframe(etr_df, use_container_width=True, hide_index=True)
+                    st.line_chart(etr_df.set_index("Date")["ETR (mm/day)"])
+
+                    avg_etr = etr_df["ETR (mm/day)"].mean()
+                    st.metric("Average ETR over period (mm/day)", f"{avg_etr:.2f}")
+
+                    csv = etr_df.to_csv(index=False).encode("utf-8")
+                    st.download_button("Download results as CSV", csv, "etr_results.csv", "text/csv")
+            except Exception as e:
+                st.error(f"Could not fetch weather data: {e}")
     else:
         st.write("Select a location on the map above to see results here.")
 
@@ -591,22 +694,45 @@ with tab_state:
 # offering the date range actually available for that specific selection.
 # ============================================================================
 with tab_history:
-    st.subheader("Historical ETR archive: 1951-2025")
-    st.caption(
-        "Built from IMD's gridded daily temperature dataset (39 grid points covering "
-        "Maharashtra) via the Hargreaves method, aggregated to state/district/taluka level."
+    st.subheader("Historical ETR archive")
+
+    source_label = st.radio(
+        "Data source", ["IMD (1951-2025)", "Skymet / PoCRA (2022-2026)"],
+        horizontal=True, key="hist_source",
     )
 
-    if not hist.base_files_exist():
-        st.error(
-            "Historical base files haven't been built yet. Run `python etr_historical.py` "
-            "once (reads the NetCDF files in `temperature/` and writes `data/etr_history/`)."
+    if source_label.startswith("IMD"):
+        source_mod = hist
+        state_loader, district_loader, taluka_loader, avail_loader = (
+            load_history_state, load_history_district, load_history_taluka, load_history_availability,
         )
+        st.caption(
+            "Built from IMD's gridded daily temperature dataset (39 grid points covering "
+            "Maharashtra) via the Hargreaves method, aggregated to state/district/taluka level."
+        )
+        build_hint = "Run `python etr_historical.py` once (reads NetCDF files in `temperature/`)."
+        source_tag = "IMD"
     else:
-        state_hist = load_history_state()
-        district_hist = load_history_district()
-        taluka_hist = load_history_taluka()
-        avail_df = load_history_availability()
+        source_mod = skymet
+        state_loader, district_loader, taluka_loader, avail_loader = (
+            load_skymet_state, load_skymet_district, load_skymet_taluka, load_skymet_availability,
+        )
+        st.caption(
+            "Built from PoCRA's automatic weather station network (run by Skymet) via the "
+            "Hargreaves method. Denser than IMD (1,000-2,300 real stations, growing over time) "
+            "but less consistent - stations come and go, and there's a network-wide gap from "
+            "Nov 2022 to mid-2023. Missing dates show as **NA**, not an estimate."
+        )
+        build_hint = "Run `python etr_skymet.py` once (reads NetCDF files in `D:\\VIP\\0.Data\\rain\\0_NetCDF_Data\\PoCRA\\`)."
+        source_tag = "Skymet"
+
+    if not source_mod.base_files_exist():
+        st.error(f"{source_tag} base files haven't been built yet. {build_hint}")
+    else:
+        state_hist = state_loader()
+        district_hist = district_loader()
+        taluka_hist = taluka_loader()
+        avail_df = avail_loader()
 
         level = st.radio("Level", ["State", "District", "Taluka"], horizontal=True, key="hist_level")
 
@@ -614,59 +740,78 @@ with tab_history:
         taluka_name = None
         if level == "District":
             district_name = st.selectbox(
-                "District", hist.get_district_list(district_hist), key="hist_district"
+                "District", hist.get_district_list(district_hist), key=f"hist_district_{source_tag}"
             )
         elif level == "Taluka":
             district_name = st.selectbox(
-                "District", hist.get_district_list(district_hist), key="hist_district_for_taluka"
+                "District", hist.get_district_list(district_hist), key=f"hist_district_for_taluka_{source_tag}"
             )
             taluka_name = st.selectbox(
-                "Taluka", hist.get_taluka_list(taluka_hist, district_name), key="hist_taluka"
+                "Taluka", hist.get_taluka_list(taluka_hist, district_name), key=f"hist_taluka_{source_tag}"
             )
 
         avail_row = hist.get_availability_row(avail_df, level, district_name, taluka_name)
-        avail_start = avail_row["start"].date()
-        avail_end = avail_row["end"].date()
-        st.info(f"Data available from **{avail_start}** to **{avail_end}** for this selection.")
 
-        c1, c2 = st.columns(2)
-        with c1:
-            dl_start = st.date_input(
-                "From", value=avail_start, min_value=avail_start, max_value=avail_end, key="hist_start"
+        if avail_row is None or pd.isna(avail_row["start"]):
+            st.warning(
+                f"No {source_tag} data is available for this selection at all "
+                "(e.g. Skymet/PoCRA has no agricultural weather stations in Mumbai City/Suburban)."
             )
-        with c2:
-            dl_end = st.date_input(
-                "To", value=avail_end, min_value=avail_start, max_value=avail_end, key="hist_end"
-            )
-
-        if dl_start > dl_end:
-            st.error("Start date must be before end date.")
         else:
-            series = hist.get_unit_series(
-                level, state_hist, district_hist, taluka_hist, district_name, taluka_name
-            )
-            mask = (series["Date"] >= pd.Timestamp(dl_start)) & (series["Date"] <= pd.Timestamp(dl_end))
-            series_range = series.loc[mask].sort_values("Date")
-
-            st.line_chart(series_range.set_index("Date")["ETR_mm_day"])
-
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Days in range", len(series_range))
-            m2.metric("Average ETR (mm/day)", f"{series_range['ETR_mm_day'].mean():.2f}")
-            m3.metric(
-                "Range (mm/day)",
-                f"{series_range['ETR_mm_day'].min():.2f} - {series_range['ETR_mm_day'].max():.2f}",
+            avail_start = avail_row["start"].date()
+            avail_end = avail_row["end"].date()
+            st.info(
+                f"Data available from **{avail_start}** to **{avail_end}** for this selection "
+                + ("." if source_tag == "IMD" else "(gaps within this range are possible - shown as NA below).")
             )
 
-            unit_label = {"State": "Maharashtra", "District": district_name, "Taluka": taluka_name}[level]
-            out = series_range.rename(columns={"ETR_mm_day": "ETR (mm/day)"}).copy()
-            out["Date"] = out["Date"].dt.strftime("%Y-%m-%d")
-            csv = out.to_csv(index=False).encode("utf-8")
-            safe_name = str(unit_label).replace(" ", "_")
-            st.download_button(
-                f"Download {level} ETR CSV ({dl_start} to {dl_end})",
-                csv,
-                f"etr_{safe_name}_{dl_start}_{dl_end}.csv",
-                "text/csv",
-                key="hist_download",
-            )
+            c1, c2 = st.columns(2)
+            with c1:
+                dl_start = st.date_input(
+                    "From", value=avail_start, min_value=avail_start, max_value=avail_end,
+                    key=f"hist_start_{source_tag}",
+                )
+            with c2:
+                dl_end = st.date_input(
+                    "To", value=avail_end, min_value=avail_start, max_value=avail_end,
+                    key=f"hist_end_{source_tag}",
+                )
+
+            if dl_start > dl_end:
+                st.error("Start date must be before end date.")
+            else:
+                series = hist.get_unit_series(
+                    level, state_hist, district_hist, taluka_hist, district_name, taluka_name
+                )
+                mask = (series["Date"] >= pd.Timestamp(dl_start)) & (series["Date"] <= pd.Timestamp(dl_end))
+                series_range = series.loc[mask].sort_values("Date")
+                valid = series_range["ETR_mm_day"].dropna()
+
+                st.line_chart(series_range.set_index("Date")["ETR_mm_day"])
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Days with data / in range", f"{len(valid)} / {len(series_range)}")
+                if len(valid):
+                    m2.metric("Average ETR (mm/day)", f"{valid.mean():.2f}")
+                    m3.metric("Range (mm/day)", f"{valid.min():.2f} - {valid.max():.2f}")
+                else:
+                    m2.metric("Average ETR (mm/day)", "NA")
+                    m3.metric("Range (mm/day)", "NA")
+
+                unit_label = {"State": "Maharashtra", "District": district_name, "Taluka": taluka_name}[level]
+                out = series_range.rename(columns={"ETR_mm_day": "ETR (mm/day)"}).copy()
+                out["Date"] = out["Date"].dt.strftime("%Y-%m-%d")
+                out["ETR (mm/day)"] = out["ETR (mm/day)"].map(
+                    lambda x: "NA" if pd.isna(x) else f"{x:.2f}"
+                )
+                st.dataframe(out, use_container_width=True, hide_index=True)
+
+                csv = out.to_csv(index=False).encode("utf-8")
+                safe_name = str(unit_label).replace(" ", "_")
+                st.download_button(
+                    f"Download {level} {source_tag} ETR CSV ({dl_start} to {dl_end})",
+                    csv,
+                    f"etr_{source_tag}_{safe_name}_{dl_start}_{dl_end}.csv",
+                    "text/csv",
+                    key=f"hist_download_{source_tag}",
+                )

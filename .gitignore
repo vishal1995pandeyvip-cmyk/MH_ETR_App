@@ -14,6 +14,10 @@ India_SRTM/
 # deployed app - Versions/Version_N/VERSION_INFO.md has the summary if ever needed)
 Versions/
 
+
 # Runtime/log artifacts
 *.log
 streamlit_log.txt
+
+# Secrets (API credentials) - never commit these
+.streamlit/secrets.toml

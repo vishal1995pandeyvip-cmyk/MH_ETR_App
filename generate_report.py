@@ -383,7 +383,30 @@ doc.add_paragraph(
 
 add_heading("Changes so far", level=2)
 add_bullets([
-    "(none yet)",
+    "Second data source added to the Historical Data tab: Skymet/PoCRA, alongside IMD. PoCRA "
+    "(Project on Climate Resilient Agriculture) operates an automatic weather station (AWS) "
+    "network across Maharashtra, run by Skymet, far denser than IMD's 39 fixed grid points "
+    "(1,400-2,300+ real stations, growing over time). A new module (etr_skymet.py) aggregates "
+    "hourly Tmax/Tmin per station to daily, computes Hargreaves ETR per station, then averages "
+    "whichever stations actually reported that day into state/district/taluka values - the same "
+    "output schema as the IMD archive, so the app's UI and download logic are shared between "
+    "both sources with just a data-source selector added.",
+    "Unlike IMD's fixed, always-complete network, PoCRA station coverage genuinely varies: "
+    "station count changes year to year, there is a real network-wide gap from Nov 2022 to "
+    "mid-2023, and per-unit data availability differs (e.g. some districts' stations only came "
+    "online partway through 2022 or 2023). Rather than estimating over these gaps, missing "
+    "dates are shown as NA in the table/CSV and as a break in the chart line - and Mumbai City "
+    "and Mumbai Suburban districts correctly show no data at all, since PoCRA is an "
+    "agricultural monitoring network with no stations in those fully urban districts.",
+    "Live Skymet option added to Point Lookup: a third source, \"Skymet live (nearest station)\", "
+    "alongside the existing Open-Meteo forecast/historical options. Clicking a point finds the "
+    "nearest real PoCRA weather station (within 25 km) and fetches its actual observed data via "
+    "the official live API (login + station query, confirmed by direct testing to reject future "
+    "dates - it serves observed readings only, not a forecast). Scoped to Point Lookup only, not "
+    "the Statewide Map: querying all ~2,300 stations for a single day returns roughly 1 million "
+    "raw readings, timed at about 7 minutes to fully page through - impractical for an "
+    "on-demand map click, whereas a single station's data returns in under a second. API "
+    "credentials are kept out of the codebase entirely, via Streamlit's secrets mechanism.",
 ])
 
 out_path = r"d:\VIP\1.Task\2.Gorantiwar_Sir\Task_1\Project_Report.docx"
